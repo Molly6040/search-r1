@@ -1,0 +1,151 @@
+GRPO TensorBoard 指标完整说明（2026-11-25，修正版）
+
+使用范围
+代码：Search-R1-reviewed；原始解压 Search-R1-main 未覆盖。
+继续使用 trainer.logger=['console','wandb','tensorboard']。
+TENSORBOARD_LOGDIR 必须指向新的独立 run（例如 <experiment>/entropy-v2-restart250）。
+TB_STEP_OFFSET 是父 checkpoint 已完成 rollout 更新步数，不是 Adam minibatch 步数。
+旧 events 不会自动改名或获得新指标；不能补算没有存下来的熵。
+本说明针对当前 do_search=true、GRPO、state_masking=true 的训练路径。
+以下是已实现指标；末尾另外列出未实现项，不混淆。
+
+0. 统一口径
+一个训练 step 包括采样一批轨迹及若干 actor minibatch 更新。
+action mask=info_mask & attention_mask 的 response 部分；排除工具正文和 padding。
+actor 更新内部使用 loss_mask，当前由同一 info_mask 构造。
+全 batch 指标在 driver 计算；update_micro_mean 表示微批/rank均值，明确不冒充全局 token均值。
+自然对数单位 nat。temperature/top_p 不一致时不能把完整 softmax 当实际采样分布。
+
+1. 主熵指标：更新前、T=1、整个词表（新增，首选）
+policy/entropy_pre_token_mean
+  定义 sum_action H(softmax(raw logits))/N_action。所有 DP 输出先按样本汇回 driver 后再归约。
+  模型处于 eval，参数在本轮 actor 更新前；输入是当前 rollout 的完整历史。
+  高：预测分布分散；低：分布集中。没有通用最佳阈值。
+  急升 + 正确率降/非法动作升/梯度升值得警惕；急降 + 重复行为升可能探索退化。
+policy/entropy_pre_sequence_mean
+  每条非空轨迹先 action-token 平均，再对轨迹等权平均。
+  与 token_mean 的差距变化，可能来自轨迹长度与熵的关联变化。
+policy/entropy_pre_action_token_count
+  主熵有效 action token 总数，应与 tokens/action_total 相等（当前 mask 一致时）。
+policy/entropy_pre_nonempty_sequence_count
+  有至少一个 action token 的轨迹数。一般等于 batch 轨迹总数。
+policy/entropy_pre_nonfinite_fraction
+  action 位置熵为 NaN/Inf 的比例，正常必须为0；非0时主均值也保留异常，不静默丢弃。
+  全空 batch 不产生均值（不是写0），同时 count=0，并看 empty_action_fraction。
+
+公式：H= -sum_v p_v log p_v, p=softmax(z), mask=m。
+H_token=sum_it m_it H_it / sum_it m_it。
+H_sequence=mean_{i:L_i>0}[sum_t m_it H_it/L_i]。
+为避免 BF16 中两项相减消去误差，诊断使用 FP32 log_softmax，driver 用 FP64 累加。
+按 token chunk 转 FP32，避免一次复制完整大词表 logits；有额外计算开销但没有额外模型前向。
+这不是固定探针熵：rollout 样本和上下文随训练变化；不能单靠它证明参数层面的因果退化。
+
+2. 奖励和验证
+train/score_mean：每条轨迹原始 score 总和，再对 batch 平均。当前纯 EM=训练正确率。
+train/reward_mean：每条轨迹优化用 reward 总和的均值；use_kl_loss=true 时等于 score。
+train/binary_score_success_fraction：仅当前 batch score 全为0/1时输出，等于 score_mean；
+  它只是二元 score=1比例，若未来改奖励，不一定语义上仍是答案正确率。
+val/test_score/<data_source>：原版验证奖励均值；当前 EM 配置下为验证 EM，越高越好。
+  同时看训练/验证差距；比较时固定数据、检索库、解码和预算。
+
+3. GRPO 有效学习信号
+分组严格使用 uid，不按重排后的相邻行分组。
+grpo/group_count：本批不同 uid 数；当前512道题、每题5条，预期512组。
+grpo/group_size_min,max：最小/最大真实组大小，当前预期均为5。
+grpo/singleton_group_fraction：组大小1的比例，正常0，否则检查 uid/分组。
+grpo/reward_std_mean：每组 reward 的样本标准差（ddof=1），再按组平均。
+grpo/zero_variance_group_fraction：组内 reward 全相同的比例；高表示可区分的奖励信号少。
+grpo/all_zero_score_group_fraction：二元奖励时全0组比例；高可能问题太难或整体退化。
+grpo/all_one_score_group_fraction：二元奖励时全1组比例；高可能题目太容易或已学会。
+  后两者仅 score 全为0/1时输出；KL塑形后 rewards 与 scores 不同，不能直接与零方差组等同。
+grpo/sequence_advantage_mean：每轨迹 action位置平均优势，再对非空轨迹等权平均；
+  标准组内归一化通常接近0，不能用它衡量模型进步。
+grpo/zero_advantage_sequence_fraction：非空轨迹中平均优势恰为0的比例，表示结果奖励无区分更新。
+  零优势不代表整个 loss 没有梯度：KL/entropy 正则仍可能更新。
+
+4. 更新过程熵、KL、loss（原版统计口径保留并明确命名）
+policy/entropy_micro_mean：本轮更新过程中每个 microbatch 有效 action token熵的均值，再均值。
+  使用 rollout temperature 的完整 softmax；不同 minibatch 对应不同参数版本。
+  用于解释 entropy 正则，不作为主熵曲线。当前 entropy_coeff=0.001，loss减去该项乘系数。
+policy/reference_kl_micro_mean：当前策略对固定 ref 的 kl_loss_type估计，microbatch/rank均值。
+  当前 low_var_kl 是采样估计，不是精确全词表KL。高说明离基座更远，不一定坏。
+actor/kl_coef：参考策略 KL 正则系数，当前0.001。
+policy/old_current_k1_micro_mean：mean(old_logp-current_logp)，有符号采样估计。
+  可能为负；不能把负值判为计算错误，也不能与 reference KL混用。
+actor/pg_loss：clipped policy surrogate loss 的 microbatch/rank均值；不同 batch优势变化时不可当质量。
+actor/pg_clipfrac：真正由 clipped 分支胜出的 token比例，不是所有 ratio越界比例。
+  正优势 r>1+eps 与负优势 r<1-eps 时对应截断；零优势不产生该截断贡献。
+optim/grad_norm_preclip_minibatch_mean：clip_grad_norm_返回的裁剪前范数，按minibatch/rank平均。
+  超过 grad_clip 不意味着最终更新未裁剪；均值也可能掩盖单步尖峰。
+optim/lr_next_rollout_update：scheduler.step 后的LR，即下一个rollout更新用的值。
+
+5. 概率比诊断（已实现，更新过程口径）
+前缀 diagnostics/update_micro_mean/{all,positive,negative}/
+all=有效action位置；positive/negative按该位置 advantage正负划分。
+count：每个microbatch的对应token数，最终是均值，不是全局总数。
+logratio_mean：mean(logp_current-logp_old)。持续明显为负表示采样行为概率下降。
+ratio_mean：mean(exp(logratio))。不能从均值接近1推断尾部安全。
+ratio_below_clip_fraction：r<1-eps比例；positive分组下降尾部尤其值得关注。
+ratio_above_clip_fraction：r>1+eps比例。
+k3_old_current_sample_mean：mean(r-1-log r)，逐token非负估计；r=exp(logratio)。
+  在真实old-policy采样的理想条件下对应old||current KL估计；这里有top-p/重编码差异，不能称精确KL。
+空正/负组不写条件均值；不要把缺失值当0。当前汇总是micro/rank均值，不同组出现的微批数可不同。
+这些是优化过程监控，不是更新完成后的固定轨迹LLD指标，也不是vLLM与训练引擎概率偏差。
+
+6. token/吞吐
+ tokens/action_mean,total：参与策略loss的模型token均值/总量。
+ tokens/observation_mean：response有效context token数减action token数，含工具/环境反馈。
+ tokens/context_mean：拼接response的有效token均值（模型+环境，不含初始prompt）。
+ data/empty_action_fraction：action长度为0的轨迹比例，通常应为0。
+ throughput/action_tokens_per_s_step：保留的action tokens/整步秒数。
+ throughput/action_tokens_per_s_gen：保留的action tokens/gen阶段秒数。
+ throughput/trajectories_per_s：轨迹数/整步秒数。
+ 截掉/丢掉的raw生成不在分子，因此不是vLLM原始decode吞吐；gen包含工具等待。
+ timing_s/<stage>：gen/ref/adv/update_actor/step，以及发生时的testing/save_checkpoint等原始秒数。
+ step含子阶段，不能与子阶段相加求总耗时；保存/验证步应分开比较。
+ mfu/actor：原版理论FLOPs估算，不是nvidia-smi GPU利用率，只作同配置相对参考。
+ global_seqlen/{min,max,minmax_diff,balanced_min,balanced_max,mean}：原版负载平衡前后长度统计，
+   用于看各数据并行rank的token负载差距，不是生成质量指标。
+
+7. 现有环境指标（保持原名，存在语义限制）
+ env/finish_ratio：1-最终active_mask均值，即解析为answer而终止的轨迹比例；不保证非空或正确。
+ env/number_of_actions/{mean,max,min}：原turns_stats计数，最多max_turns+1个动作机会。
+ env/number_of_valid_action：每轨迹合法search/answer动作数量的均值，不是总数。
+ env/ratio_of_valid_action：先逐轨迹 valid_action_count/turn_count，再平均。
+ env/number_of_valid_search：每轨迹被解析为search的次数均值；包括最后do_search=False阶段的search，
+   不是实际执行检索次数。看上升同时看完成率，不能把多搜索等同于提升。
+
+8. legacy/（仅用于对照，不作为推荐主指标）
+ legacy/critic/score/{mean,max,min}：原始每轨迹score统计。
+ legacy/critic/rewards/{mean,max,min}：原始每轨迹reward统计。
+ legacy/critic/advantages/{mean,max,min}：旧response mask（含observation）下的token统计。
+ legacy/critic/returns/{mean,max,min}：GRPO中与advantages相同，不是critic预测目标。
+ legacy/response_length/{mean,max,min,clip_ratio}：含环境正文的response长度；clip_ratio不是实际截断率。
+ legacy/prompt_length/{mean,max,min,clip_ratio}：初始prompt长度，clip_ratio只比较张量宽度。
+ legacy/state_tokens/{total,coverage}：实际为action token数/其占response比例，旧命名反向。
+ legacy/timing_per_token_ms/<stage>：旧分母含环境token，不用作真实生成速度。
+ 当前GRPO不应有critic/values、critic/vf_explained_var或critic更新loss；如果出现先查是否混了PPO run。
+ 若关闭use_kl_loss，原版可能输出critic/kl、critic/kl_coeff（reward shaping路径），名字仍非critic存在证据。
+
+9. 目前没有的新指标（不要误认为本次已经接入）
+真实finish_reason截断率；真实工具执行数/重复query；分动作类型/轮次熵；固定probe更新后似然变化；
+全局ratio分位数与直方图；vLLM原始采样logprob一致性；梯度尖峰max/p95；逐阶段检索服务计时。
+GPU监控为独立脚本：旧脚本Unix秒作step且10分钟超时，与训练step无法直接对齐，未在本次修补。
+
+10. 推荐固定看板与判断顺序
+第一屏：val EM、train score、finish_ratio、entropy_pre_token_mean、entropy_pre_sequence_mean。
+第二屏：零方差/全错/全对组、组大小、positive ratio低尾、pg_clipfrac、reference KL、grad norm、LR。
+第三屏：action/observation长度、search意图数、吞吐、timing_s各阶段。
+reward掉：先查完成率/空action/非有限值，再查梯度、ratio和熵，最后排除检索/输入模板改变。
+熵涨而EM涨：可能正常探索；熵涨而EM掉/输出失常：值得排查，但不能单独确诊LLD。
+熵降而EM涨：可能正常收敛；熵降且重复搜索/全错组涨：可能行为退化。
+全对组高：缺乏奖励区分但不等于模型崩溃；全错组高且验证同步掉更危险。
+关闭TensorBoard smoothing查看尖峰；不同checkpoint分支独立run；旧分支失败段必须保留。
+
+计算检查与限制
+主熵不经过旧metrics的rank平均；逐token结果经DataProto DP拼接/序列并行后处理后在driver归约。
+原始action mask来自同一条轨迹，熵计算在负载重排之前；不会与重排后的样本错配。
+主熵在原logprob前向、温度缩放前计算，不改变old_logprob/策略损失/梯度。
+新浮点熵立即pop并汇总，不会被后续batch.long()误转成整数。
+动态microbatch重排后，logprob和entropy使用相同逆置换恢复顺序。
+本地数值/事件读写测试通过；尚未执行远端CUDA/FSDP/vLLM多卡集成验证。

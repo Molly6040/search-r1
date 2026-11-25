@@ -1,0 +1,154 @@
+Search-R1 代码审计与指标方案（2026-11-25）
+
+范围与交付
+原件 Search-R1-main 与 searchr1_scripts 已解压；分卷 ZIP 合并并通过 CRC 测试。
+官方基线 upstream-Search-R1，commit 598e61bd1d36895726d28a8d06b3a15bed19f5d3。
+Search-R1-reviewed 是修正版副本；reviewed-changes.patch 是相对解压原件的补丁。
+仅本机审阅、测试；没有连接训练服务器、没有修改正在运行的训练。
+没有完整正式训练日志、TensorBoard events、optimizer shards、parquet 或训练服务器性能数据。
+因此不能诊断实际崩塌发生原因，不能声称 GPU/FSDP 端到端验收完成。
+
+一、确认的问题（按优先级）
+
+P1 续训并非“完全对齐”。run_formal_4gpu.sh 未设置 VERL_DATA_SEED，run_resume.sh 才设 42。
+重新用 seed=42 推演 randperm 无法重建之前使用全局 RNG 的 shuffle。缺少 Python/NumPy/Torch/CUDA/
+vLLM RNG 状态与 sampler 状态，optimizer 目录不存在时还会静默冷启动。应把旧历史称为 warm restart。
+以后从头训练就保存完整状态、配置/代码/数据哈希、world_size、已完成步数及 checkpoint complete 标志；
+显式恢复原始 ref 是正确改动。恢复 optimizer 前校验每个 rank 文件存在及 wrapping/world_size 一致。
+原始 run_resume 注释同时写着“近似续训”和“真续训”，容易造成实验误读。
+
+P1 merge_tb_history.py 使用 SummaryWriter(purge_step=0)，可使 TensorBoard 隐藏已有 step>=0 的事件。
+它把从 130 恢复分支只从 136 拼入主线：131-135 的实际祖先来自新分支，却显示旧分支。
+强防御版失败段被剔除，不能用拼接图证明连续训练稳定。重写事件还丢弃原 wall_time。
+不要运行此脚本；保留每个 restart 独立 run，显示 parent checkpoint、参数变化和失败分支。
+本次未运行、未修改/删除任何历史事件。
+
+P1 官方继承的训练步数 off-by-one：global_steps 从 1 开始，更新后先 +=1，再 >=total 判断。
+配置 N 实际只执行 N-1 步。smoke 日志配置 2 对应 step1 train、step2 final val 印证。
+新增的“最后保存”条件在 N 步才触发，因此到不了该分支。副本修为 >total，最终 val 标在已完成步。
+
+P2 自定义 optimizer restore 在 scheduler 建好后 load_state_dict，会覆盖首个恢复更新的 LR。
+副本恢复 optimizer 后重新设置 scheduler 计算的 LR。旧 checkpoints 是否保存了可靠 Adam 状态仍待验证。
+
+P2 官方 actor/kl_loss 每个 microbatch 直接覆盖，最终仅剩最后一个 microbatch（再跨 rank 平均）。
+副本改为 append，得到明确的 microbatch 均值。其他 actor 指标原本也是 microbatch/rank 均值，
+不等于全局 token 加权平均，尤其长度变化时。未改变 loss 权重，以免暗中改变训练算法。
+
+P2 官方 telemetry 命名/定义不清：
+- critic/score 与 critic/rewards 不表示训练 critic。GRPO use_critic=False，不创建/更新 value 网络。
+- use_kl_loss=true 时 rewards=scores，KL 单独进 actor objective；不能把两条曲线解释成惩罚前后。
+- GRPO returns 与 advantages 是同一张张量，不是 critic 的价值目标。
+- advantages 的原日志按包含 observation 的 response token 平均，有长度加权偏置。
+- response_length 含模型生成及工具返回；clip_ratio 只看是否等于 batch 的张量宽度，不是截断事件。
+- state_tokens/total 实为 loss_mask.sum，即参与策略 loss 的 action token 数，名字反了。
+- entropy_loss 数值为正的 token entropy；实际 loss 中是减去 entropy_coeff * entropy。
+- actor/ppo_kl = mean(old_logp-current_logp)，有符号 sampled k1，不是精确非负 KL。
+- actor/lr 在 scheduler.step() 后记录，表示下轮更新将用的 LR。
+- valid_search_stats 包括最后 do_search=False 时模型仍选择 search 的动作，不能当真实工具执行数。
+- max_turns=2 实际最多两轮可检索动作，再一轮 final generation，共最多三次模型动作。
+- GPU monitor 用 Unix 秒作为 global_step；与训练迭代不是一个横轴。10 分钟无日志自动退出，
+  而附带 smoke 一个 step 1060 秒，监控可能在训练正常进行时自杀。
+
+P2 官方奖励解析与 token 流的潜在风险：RewardManager decode prompt+response（含检索正文）；
+qa_em.extract_solution 要求至少两个 answer 匹配并取最后一个，隐式依赖 prompt 中的标签示例。
+改变模板或检索文档包含 answer 标签时可能误计。应单独解析 agent 最终 answer，并测试缺失/空白/
+多答案/工具伪答案等案例。本次未更改 reward，避免悄悄改变实验目标。
+generation._postprocess_responses decode -> 字符串截断 -> encode，后续又重算 logprob；
+需记录 raw token 与 retokenized token 一致性，不能仅靠 recomputed old_logprob 看出采样分布偏差。
+这是风险而非已证明本次崩塌原因。
+
+合理改动：retriever return_scores=False 分支避免无条件双值解包；端口/本地路径适配合理；
+原始基座 ref 锚定合理；vllm 0.6.3 自带 cache engine 非空时不重建，常驻模式并非重复分配 bug。
+但 KV 常驻 + utilization=0.8 会挤占 actor 更新显存，不能把占卡当性能优化。
+
+二、速度：先测量，再优化
+附带唯一完整 smoke step: gen=1024.418s / step=1060.025s（96.6%）；actor=29.136s、ref=3.457s。
+这不是正式 run 性能，gen 包含多轮生成、检索、传输等；不能说 96.6% 都是 vLLM decode。
+1. 已在副本关闭各轮 generate_sequences 的 recompute_log_prob；这些输出被 run_llm_loop 丢弃，
+   训练前完整轨迹 compute_log_prob 保留。减少重复前向，不更改完整轨迹 old_logprob 语义。
+2. 建议拆 timer：vllm_generate、retriever HTTP、query encode、FAISS search、tokenize、
+   cache init/free、weight sync、最终 old_logprob、ref、actor、checkpoint、validation。
+   当前最终 old_logprob 未单列 timer。gen token 吞吐必须只算 action tokens，不含外部文档。
+3. 固定同一批问题和配置，比较 XFORMERS/FlashAttention；现有 ab_vllm_backend.py 可参考，
+   不能未测便切换。核对旧 vLLM/FA 版本兼容与输出概率误差。
+4. 你的检索是 CPU Flat index。先测 FAISS batch/OMP 线程、查询去重与缓存（索引/编码器版本进 key）。
+   async def 内同步检索会阻塞事件循环，单训练客户端可能没影响；并发不能靠改 async 解决。
+   REPRO 写明最终 segfault 修复来自 LD_PRELOAD，代码注释声称 async 修复过时。
+   ANN/GPU 检索可能很快但会改变召回或显存预算，必须报告 recall@k/EM 对照。
+5. 若有独占卡和显存余量，逐一测试关闭 param/optimizer/grad offload，减少 CPU-GPU 搬运。
+   先降低/释放 KV 占用，不能同时维持 0.8 KV、关 offload、扩大 microbatch。
+6. resume microbatch=16、logprob=32 比 formal 的 64/128 小；增加会降低 launch 开销，
+   但原 loss 是 microbatch masked mean，长度不均时改变 microbatch 可改变梯度权重，不能宣称严格等价。
+7. 每10步保存 HF 全量权重+Adam 分片很贵；结合写盘计时决定频率，保存完整状态与原子完成标志。
+8. dynamic batching 在这份老 actor 中仍按固定 gradient_accumulation 缩放，直接打开可能改有效梯度尺度；
+   先修动态 microbatch 的权重和全局 token 归一化，再评估。不要直接升级整套 verl 后认为算法没变。
+
+三、指标字典与 TensorBoard 接入
+原则：区分 rollout step、optimizer minibatch step 和 wall time；每个 restart 一个独立 run。
+所有策略指标使用模型 action mask，排除 padding、检索正文和环境反馈。按轮拆分另需 turn_id。
+二元 EM 的成功阈值只适用于确认 score=0/1 的配置，F1 不应套同样定义。
+
+已在 reviewed 副本实现（自动经原 Tracking 写到 TensorBoard/console/wandb）：
+train/score_mean = mean_i sum_t score_it；当前 EM 配置等于训练样本正确率。
+train/reward_mean = mean_i sum_t reward_it；与 score 相同是当前 KL 入 loss 的预期行为。
+tokens/action_mean,total = loss_mask 对每条轨迹/全 batch 求和；observation_mean=context-action。
+grpo/group_count,size_min,max = 按 uid 真实分组统计，检查 n_agent=5 是否真的一题五条。
+grpo/reward_std_mean = 每组 rewards 的样本标准差（unbiased=True，与原 GRPO 一致）的均值。
+grpo/zero_variance_group_fraction = std==0 的组数/组总数。
+grpo/all_zero_score_group_fraction,all_one_score_group_fraction = 二元 score 下全错/全对组比例。
+grpo/singleton_group_fraction = 组大小1比例；正常五条采样应为0。
+grpo/sequence_advantage_mean = 先每条 action token 平均优势，再对非空轨迹平均，避免长度加权。
+grpo/zero_advantage_sequence_fraction = 非空轨迹中平均优势为0的比例。
+data/empty_action_fraction = 没有 action token 的轨迹比例。
+throughput/action_tokens_per_s_step,gen = 保留下来的 action tokens / 对应耗时；
+不是 vLLM 原始 decode 吞吐（截掉的 token 不在分子），gen 也包含工具等待。
+throughput/trajectories_per_s = batch轨迹数/step秒。
+diagnostics/update_micro_mean/{all,positive,negative}/：
+  ratio_mean = mean exp(logp_current-logp_old)；logratio_mean 为其 log 的平均。
+  ratio_below_clip_fraction = ratio<1-eps 比例；above 类似。
+  k3_old_current_sample_mean = mean(ratio-1-logratio)，非负的采样估计，非精确 KL。
+  count = 每个 microbatch 的所选有效 token 数，经现有 reducer 变成 microbatch/rank 均值。
+这些指标是更新过程中的 microbatch 均值，不能冒充同一策略的全局 token 加权统计，也不是 post-update LLD。
+TensorBoard 将易误读的旧指标放 legacy/；entropy、KL、grad_norm 和 next LR 改明确名字。
+日志 scalar 不额外做 smoothing；TensorBoard UI 平滑只用于展示，排查时看原始曲线。
+
+建议第二阶段增加（未伪称本次已实现）：
+A 行为：真实执行 search 数、尝试 search 数、非法动作率、最终答案非空率、完成率、重复 query 率。
+   在 execute_predictions 中记录实际调用事件；区分最后禁止调用阶段的 search intent。
+B 真实截断：每轮 finish_reason=length / 生成轮数；上下文裁剪事件/轨迹数，保留裁剪前长度。
+C SAPO 风险：按 advantage 正/负分别统计 ratio p01/p50/p99、近零比例、有效 clipping、非有限值比例；
+   用全局 sums/counts 或聚合直方图，不能对分位数跨 GPU 简单平均。
+D LLDS：固定一批已完成 rollout 和完全相同 context，更新后重算 action logprob，
+   delta_i=mean_action_token(logp_after-logp_before)，记录正确轨迹 delta 均值和 delta<0 比例，
+   并按 turn 拆。每10-50步取固定小批 probe，显式计时；不能用随训练变动的样本 NLL 当因果证据。
+E 梯度：裁剪前范数 mean/max/p95、超过 grad_clip 的 optimizer step 比例、NaN/Inf、实际更新范数。
+F 泛化：固定验证集 EM、格式完成率，按 hop/难度/搜索次数分层；固定解码条件并保留失败轨迹。
+G 采样一致性：vLLM 原始 chosen-token logprob 对 HF 同 token/context 重算 logprob，报告误差分布；
+   保存真实 sampling temperature/top_p/版本。当前 old_logprob 是 HF 重算，不是 vLLM 记录。
+H 系统：各阶段秒数、action token/s、GPU util、allocated/reserved/peak、CPU RSS、检索延迟p50/p95。
+   GPU monitor 用 sampling index 做 step 并保留真实 walltime；与训练在 wall-time 视图比较。
+
+接入位置：
+- generation.py：动作/终止/截断/turn_id、原始 token 和检索计时。
+- ray_trainer.py：组级统计、验证、全局计数、probe 调度。
+- dp_actor.py：ratio/clip/entropy/梯度，用 sum/count 规约可获得精确 token 加权值。
+- fsdp_workers.py：rank 汇总、显存、实际 LR、优化器步计数。
+- tracking.py：仅负责把有明确语义的 metrics 写到 logger，不能在 logger 猜测训练行为。
+
+四、原版日志链路
+官方这个 commit 的 Tracking.supported_backend=['wandb','mlflow','console']，没有 TensorBoard。
+你的 tracking.py 加了 torch.utils.tensorboard.SummaryWriter，并把 metrics dict 的 key 原样写成 tag。
+fit -> reward_fn -> advantage -> update_actor -> compute_data_metrics/compute_timing_metrics ->
+Tracking.log -> console/W&B/TensorBoard。继承的 critic 标签不是 TensorBoard 自动发现 critic。
+W&B offline 仍会本地记录；无需联网也能保留。原 repo docs/experiment_log.md 有 W&B 实验链接。
+推荐新 run：TENSORBOARD_LOGDIR=.../tb_logs/<experiment>/<restart-id>，TB_STEP_OFFSET=<parent_step>。
+不要 purge_step=0 拼接历史；保持原 event 原封不动。训练 logger 中包含 tensorboard 后指标自动出现。
+
+文献来源
+LLDS: https://arxiv.org/abs/2512.04220 （正确轨迹似然变化、梯度、熵）
+SAPO: https://arxiv.org/abs/2603.10069 （importance ratio 漂移与正优势 token）
+Search-R1++: https://arxiv.org/abs/2602.19526 （answer avoidance、prompt/reward 分离分析）
+SID-1: https://www.sid.ai/research/sid-1-technical-report （tokens-in/tokens-out 一致性）
+这些工作启发监控设计，不代表本次代码已确诊某一种论文中的崩塌机制。
+
+验证：本地 CPU 合成张量的 mask/组统计/正负 ratio 检查、TensorBoard 真实写入读取、LR 覆盖回归和全量 Python AST 解析通过。未做 CUDA/FSDP/vLLM 训练验收。测试脚本 test_audit.py。

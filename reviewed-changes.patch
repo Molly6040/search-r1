@@ -1,0 +1,343 @@
+diff -ruN --ex Search-R1-main/search_r1/llm_agent/generation.py Search-R1-reviewed/search_r1/llm_agent/generation.py
+--- Search-R1-main/search_r1/llm_agent/generation.py	2026-11-24 23:53:22
++++ Search-R1-reviewed/search_r1/llm_agent/generation.py	2026-11-25 10:58:26
+@@ -169,12 +169,14 @@
+     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
+         """
+             Wrapper for generation that handles multi-GPU padding requirements.
+-            if num_gpus <= 1, return self.actor_rollout_wg.generate_sequences(active_batch)
++            if num_gpus <= 1, active_batch.meta_info['recompute_log_prob'] = False
++            return self.actor_rollout_wg.generate_sequences(active_batch)
+             if active_batch size is not divisible by num_gpus, pad with first sequence
+             then remove padding from output
+         """
+         num_gpus = self.config.num_gpus
+         if num_gpus <= 1:
++            active_batch.meta_info['recompute_log_prob'] = False
+             return self.actor_rollout_wg.generate_sequences(active_batch)
+             
+         batch_size = active_batch.batch['input_ids'].shape[0]
+@@ -183,6 +185,7 @@
+         for key in active_batch.batch.keys():
+             active_batch.batch[key] = active_batch.batch[key].long()
+         if remainder == 0:
++            active_batch.meta_info['recompute_log_prob'] = False
+             return self.actor_rollout_wg.generate_sequences(active_batch)
+         
+         # Add padding sequences
+@@ -199,6 +202,7 @@
+             padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
+ 
+         # Generate with padded batch
++        padded_active_batch.meta_info['recompute_log_prob'] = False
+         padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
+ 
+         # Remove padding from output
+diff -ruN --ex Search-R1-main/verl/trainer/ppo/ray_trainer.py Search-R1-reviewed/verl/trainer/ppo/ray_trainer.py
+--- Search-R1-main/verl/trainer/ppo/ray_trainer.py	2026-11-24 23:53:22
++++ Search-R1-reviewed/verl/trainer/ppo/ray_trainer.py	2026-11-25 11:42:49
+@@ -798,6 +798,12 @@
+ 
+                         with torch.no_grad():
+                             output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
++                            from verl.utils.grpo_diagnostics import entropy_metrics
++                            pre_entropy = output.batch.pop('pre_entropy_t1')
++                            width = pre_entropy.shape[-1]
++                            action_mask = final_gen_batch_output.batch['info_mask'][:, -width:].bool()
++                            action_mask &= final_gen_batch_output.batch['attention_mask'][:, -width:].bool()
++                            metrics.update(entropy_metrics(pre_entropy, action_mask))
+                             final_gen_batch_output = final_gen_batch_output.union(output)
+ 
+                         # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+@@ -891,26 +897,29 @@
+ 
+                     if self.config.trainer.save_freq > 0 and \
+                             (self.global_steps % self.config.trainer.save_freq == 0 or
+-                             self.global_steps >= self.config.trainer.total_training_steps):
++                             self.global_steps >= self.total_training_steps):
+                         with _timer('save_checkpoint', timing_raw):
+                             self._save_checkpoint()
+ 
+                 # collect metrics
+                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
++                if self.config.algorithm.adv_estimator == 'grpo':
++                    from verl.utils.grpo_diagnostics import batch_metrics
++                    metrics.update(batch_metrics(batch, timing_raw))
+ 
+                 # TODO: make a canonical logger that supports various backend
+                 logger.log(data=metrics, step=self.global_steps)
+ 
+                 self.global_steps += 1
+ 
+-                if self.global_steps >= self.total_training_steps:
++                if self.global_steps > self.total_training_steps:
+ 
+                     # perform validation after training
+                     if self.val_reward_fn is not None:
+                         val_metrics = self._validate()
+                         pprint(f'Final validation metrics: {val_metrics}')
+-                        logger.log(data=val_metrics, step=self.global_steps)
++                        logger.log(data=val_metrics, step=self.global_steps - 1)
+                     return
+     
+     def _create_loss_mask(self, batch, metrics):
+diff -ruN --ex Search-R1-main/verl/utils/grpo_diagnostics.py Search-R1-reviewed/verl/utils/grpo_diagnostics.py
+--- Search-R1-main/verl/utils/grpo_diagnostics.py	1970-01-01 08:00:00
++++ Search-R1-reviewed/verl/utils/grpo_diagnostics.py	2026-11-25 11:42:49
+@@ -0,0 +1,109 @@
++"""Read-only diagnostics. Masks exclude padding and tool observations."""
++from collections import defaultdict
++import torch
++
++@torch.no_grad()
++def batch_metrics(batch, timing):
++    b = batch.batch
++    width = b['responses'].shape[-1]
++    context = b['attention_mask'][:, -width:].bool()
++    action = b.get('loss_mask', b.get('info_mask', b['attention_mask'])[:, -width:]).bool() & context
++    scores = b['token_level_scores'].sum(-1).float()
++    rewards = b['token_level_rewards'].sum(-1).float()
++    counts = action.sum(-1)
++    m = {'train/score_mean': scores.mean().item(), 'train/reward_mean': rewards.mean().item(),
++         'tokens/action_mean': counts.float().mean().item(),
++         'tokens/observation_mean': (context.sum(-1)-counts).float().mean().item(),
++         'tokens/action_total': counts.sum().item(),
++         'tokens/context_mean': context.sum(-1).float().mean().item(),
++         'data/empty_action_fraction': (counts == 0).float().mean().item()}
++    groups = defaultdict(list)
++    for uid, value in zip(batch.non_tensor_batch['uid'], rewards.tolist()):
++        groups[uid].append(value)
++    stds = [torch.tensor(v).std(unbiased=True).item() if len(v)>1 else 0. for v in groups.values()]
++    m.update({'grpo/group_count': len(groups),
++              'grpo/group_size_min': min(map(len, groups.values())),
++              'grpo/group_size_max': max(map(len, groups.values())),
++              'grpo/reward_std_mean': sum(stds)/len(stds),
++              'grpo/zero_variance_group_fraction': sum(s == 0 for s in stds)/len(stds),
++              'grpo/singleton_group_fraction': sum(len(v)==1 for v in groups.values())/len(groups)})
++    binary = bool(((scores==0)|(scores==1)).all())
++    if binary:
++        sg = defaultdict(list)
++        for uid, value in zip(batch.non_tensor_batch['uid'], scores.tolist()): sg[uid].append(value)
++        m['train/binary_score_success_fraction'] = scores.mean().item()
++        m['grpo/all_zero_score_group_fraction'] = sum(not any(v) for v in sg.values())/len(sg)
++        m['grpo/all_one_score_group_fraction'] = sum(all(v) for v in sg.values())/len(sg)
++    seq_adv = (b['advantages'] * action).sum(-1) / counts.clamp_min(1)
++    valid = counts > 0
++    if valid.any():
++        m['grpo/sequence_advantage_mean'] = seq_adv[valid].mean().item()
++        m['grpo/zero_advantage_sequence_fraction'] = (seq_adv[valid]==0).float().mean().item()
++    for name in ('step', 'gen'):
++        if timing.get(name, 0)>0:
++            m['throughput/action_tokens_per_s_'+name] = counts.sum().item()/timing[name]
++    if timing.get('step',0)>0: m['throughput/trajectories_per_s'] = len(scores)/timing['step']
++    return m
++
++@torch.no_grad()
++def update_metrics(logp, old, advantage, mask, clip):
++    valid = mask.bool()
++    delta = (logp-old).detach().float()
++    ratio = delta.exp()
++    result = {}
++    for label, selected in [('all', valid), ('positive', valid & (advantage>0)), ('negative', valid & (advantage<0))]:
++        n = selected.sum().item()
++        result[label+'/count'] = n
++        if n:
++            d=delta[selected]; r=ratio[selected]
++            result[label+'/logratio_mean']=d.mean().item()
++            result[label+'/ratio_mean']=r.mean().item()
++            result[label+'/ratio_below_clip_fraction']=(r<1-clip).float().mean().item()
++            result[label+'/ratio_above_clip_fraction']=(r>1+clip).float().mean().item()
++            result[label+'/k3_old_current_sample_mean']=(r-1-d).mean().item()
++    # Nonnegative sample estimator; not exact KL and not rollout-engine mismatch.
++    return {'diagnostics/update_micro_mean/'+k:v for k,v in result.items()}
++
++
++@torch.no_grad()
++def entropy_fp32_chunked(logits, chunk_size=128):
++    """T=1 full-vocabulary entropy, float32; bounded temporary allocation.
++
++    Iterate slices without flattening the full possibly noncontiguous logits.
++    Called only in no-grad pre-update diagnostics; never changes entropy loss.
++    """
++    shape = logits.shape[:-1]
++    out = torch.empty(shape, device=logits.device, dtype=torch.float32)
++    if logits.ndim == 2:
++        for start in range(0, logits.shape[0], chunk_size):
++            z = logits[start:start+chunk_size].float()
++            lp = torch.log_softmax(z, dim=-1)
++            out[start:start+chunk_size] = -(lp.exp()*lp).sum(-1)
++    elif logits.ndim == 3:
++        for i in range(logits.shape[0]):
++            out[i] = entropy_fp32_chunked(logits[i], chunk_size)
++    else:
++        raise ValueError('Expected token/vocab or batch/token/vocab logits')
++    return out
++
++@torch.no_grad()
++def entropy_metrics(entropy, mask):
++    """Driver-side aggregation AFTER data-parallel gather, no rank-mean bias."""
++    if entropy.shape != mask.shape:
++        raise ValueError('Entropy/mask shape mismatch')
++    mask = mask.bool()
++    count = mask.sum(-1)
++    nonempty = count > 0
++    finite = torch.isfinite(entropy)
++    result = {'policy/entropy_pre_action_token_count': count.sum().item(),
++              'policy/entropy_pre_nonempty_sequence_count': nonempty.sum().item()}
++    n = count.sum().item()
++    if not n:
++        return result
++    result['policy/entropy_pre_nonfinite_fraction'] = ((~finite)&mask).sum().item()/n
++    # Invalid action values must be visible; do not silently drop them.
++    selected = torch.where(mask, entropy.double(), torch.zeros_like(entropy, dtype=torch.float64))
++    sums = selected.sum(-1)
++    result['policy/entropy_pre_token_mean'] = sums.sum().item()/n
++    result['policy/entropy_pre_sequence_mean'] = (sums[nonempty]/count[nonempty]).mean().item()
++    return result
+diff -ruN --ex Search-R1-main/verl/utils/tracking.py Search-R1-reviewed/verl/utils/tracking.py
+--- Search-R1-main/verl/utils/tracking.py	2026-11-24 23:53:22
++++ Search-R1-reviewed/verl/utils/tracking.py	2026-11-25 10:58:26
+@@ -83,6 +83,15 @@
+     def log(self, data, step):
+         for key, value in data.items():
+             try:
++                # Legacy names are preserved under legacy/, not silently reinterpreted.
++                if key.startswith(('critic/score/', 'critic/rewards/', 'critic/advantages/', 'critic/returns/', 'response_length/', 'prompt_length/', 'state_tokens/', 'timing_per_token_ms/')):
++                    key = 'legacy/' + key
++                aliases = {'actor/entropy_loss': 'policy/entropy_micro_mean',
++                           'actor/ppo_kl': 'policy/old_current_k1_micro_mean',
++                           'actor/kl_loss': 'policy/reference_kl_micro_mean',
++                           'actor/grad_norm': 'optim/grad_norm_preclip_minibatch_mean',
++                           'actor/lr': 'optim/lr_next_rollout_update'}
++                key = aliases.get(key, key)
+                 self.writer.add_scalar(key, float(value), global_step=step + self.step_offset)
+             except (TypeError, ValueError):
+                 pass
+diff -ruN --ex Search-R1-main/verl/workers/actor/dp_actor.py Search-R1-reviewed/verl/workers/actor/dp_actor.py
+--- Search-R1-main/verl/workers/actor/dp_actor.py	2026-11-24 23:53:24
++++ Search-R1-reviewed/verl/workers/actor/dp_actor.py	2026-11-25 11:42:49
+@@ -55,7 +55,7 @@
+ 
+         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+ 
+-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
++    def _forward_micro_batch(self, micro_batch, temperature, entropy_temperature_one=False) -> Tuple[torch.Tensor, torch.Tensor]:
+         """
+         Returns: 
+             entropy: # (bs, response_len)
+@@ -97,10 +97,14 @@
+                                            use_cache=False)  # prevent model thinks we are generating
+                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+ 
++                if entropy_temperature_one:
++                    from verl.utils.grpo_diagnostics import entropy_fp32_chunked
++                    entropy_rmpad = entropy_fp32_chunked(logits_rmpad)
+                 logits_rmpad.div_(temperature)
+ 
+                 # compute entropy
+-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
++                if not entropy_temperature_one:
++                    entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+ 
+                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+@@ -133,10 +137,14 @@
+                                            position_ids=position_ids,
+                                            use_cache=False)  # prevent model thinks we are generating
+                 logits = output.logits
++                if entropy_temperature_one:
++                    from verl.utils.grpo_diagnostics import entropy_fp32_chunked
++                    entropy = entropy_fp32_chunked(logits[:, -response_length - 1:-1])
+                 logits.div_(temperature)
+                 logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
+                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
+-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
++                if not entropy_temperature_one:
++                    entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+ 
+             return entropy, log_probs
+ 
+@@ -150,7 +158,7 @@
+         self.actor_optimizer.step()
+         return grad_norm
+ 
+-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
++    def compute_log_prob(self, data: DataProto, return_entropy=False):
+         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
+ 
+         Args:
+@@ -186,19 +194,27 @@
+             micro_batches = batch.split(micro_batch_size)
+ 
+         log_probs_lst = []
++        entropy_lst = []
+         for micro_batch in micro_batches:
+             with torch.no_grad():
+-                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
++                entropy, log_probs = self._forward_micro_batch(
++                    micro_batch, temperature=temperature, entropy_temperature_one=return_entropy)
++            if return_entropy:
++                entropy_lst.append(entropy)
+             log_probs_lst.append(log_probs)
+         log_probs = torch.concat(log_probs_lst, dim=0)
++        if return_entropy:
++            entropy = torch.concat(entropy_lst, dim=0)
+ 
+         if use_dynamic_bsz:
+             indices = list(itertools.chain.from_iterable(indices))
+             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
+             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+             log_probs = log_probs[revert_indices]
++            if return_entropy:
++                entropy = entropy[revert_indices]
+ 
+-        return log_probs
++        return (log_probs, entropy) if return_entropy else log_probs
+ 
+     def update_policy(self, data: DataProto):
+         # make sure we are in training mode
+@@ -254,6 +270,8 @@
+                                                                               advantages=advantages,
+                                                                               eos_mask=response_mask,
+                                                                               cliprange=clip_ratio)
++                from verl.utils.grpo_diagnostics import update_metrics
++                append_to_dict(metrics, update_metrics(log_prob, old_log_prob, advantages, response_mask, clip_ratio))
+                 # compute entropy loss from entropy
+                 entropy_loss = verl_F.masked_mean(entropy, response_mask)
+ 
+@@ -269,7 +287,7 @@
+                     kl_loss = masked_mean(kld, response_mask)
+ 
+                     policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+-                    metrics['actor/kl_loss'] = kl_loss.detach().item()
++                    append_to_dict(metrics, {'actor/kl_loss': kl_loss.detach().item()})
+                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
+ 
+                 loss = policy_loss / self.gradient_accumulation
+diff -ruN --ex Search-R1-main/verl/workers/fsdp_workers.py Search-R1-reviewed/verl/workers/fsdp_workers.py
+--- Search-R1-main/verl/workers/fsdp_workers.py	2026-11-24 23:53:22
++++ Search-R1-reviewed/verl/workers/fsdp_workers.py	2026-11-25 11:42:49
+@@ -337,7 +337,10 @@
+                 _opt_shard = os.path.join(_opt_state_dir, f'fsdp_optim_rank{self.rank}.pt')
+                 if os.path.exists(_opt_shard):
+                     _opt_sd = torch.load(_opt_shard, map_location='cpu')
++                    _scheduled_lrs = self.actor_lr_scheduler.get_last_lr()
+                     self.actor_optimizer.load_state_dict(_opt_sd)
++                    for _group, _lr in zip(self.actor_optimizer.param_groups, _scheduled_lrs):
++                        _group['lr'] = _lr
+                     print(f'[resume] loaded optimizer state shard: {_opt_shard}')
+                 else:
+                     print(f'[resume][WARN] optimizer shard not found: {_opt_shard}, Adam state cold-start')
+@@ -444,8 +447,9 @@
+ 
+         with self.ulysses_sharding_manager:
+             data = self.ulysses_sharding_manager.preprocess_data(data)
+-            old_log_probs = self.actor.compute_log_prob(data=data)
+-            output = DataProto.from_dict(tensors={'old_log_probs': old_log_probs})
++            old_log_probs, pre_entropy = self.actor.compute_log_prob(data=data, return_entropy=True)
++            output = DataProto.from_dict(tensors={'old_log_probs': old_log_probs,
++                                                  'pre_entropy_t1': pre_entropy})
+             output = self.ulysses_sharding_manager.postprocess_data(output)
+             
+         output = output.to('cpu')

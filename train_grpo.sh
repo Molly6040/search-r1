@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export DATA_DIR='/cache/h30082669/searchr1/data/nq_search'
 
@@ -22,6 +24,7 @@ export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-7b-it-em
 
+export TENSORBOARD_LOGDIR="${TENSORBOARD_LOGDIR:-./tb_logs/${EXPERIMENT_NAME}/$(date +%Y%m%d-%H%M%S)-$$}"
 # set -x
 export VLLM_ATTENTION_BACKEND=XFORMERS # vllm + qwen2-7b with flash_attn has some issues
 
@@ -63,7 +66,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n_agent=5 \
     actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.actor.state_masking=true \
-    trainer.logger=['wandb'] \
+    "trainer.logger=[console,wandb,tensorboard]" \
     +trainer.val_only=false \
     +trainer.val_before_train=true \
     trainer.default_hdfs_dir=null \

@@ -79,6 +79,8 @@ class _TensorBoardAdapter:
         self.writer = writer
         import os
         self.step_offset = int(os.environ.get('TB_STEP_OFFSET', '0'))
+        # Presentation only; no additional model forwards or loss changes.
+        self.writer.add_custom_scalars({'01 Quality': {'Score': ['Multiline', ['train/score_mean', 'val/test_score/.*']], 'Completion': ['Multiline', ['env/finish_ratio', 'data/empty_action_fraction']]}, '02 Entropy': {'Pre-update entropy': ['Multiline', ['policy/entropy_pre_token_mean', 'policy/entropy_pre_sequence_mean']], 'Nonfinite': ['Multiline', ['policy/entropy_pre_nonfinite_fraction']]}, '03 GRPO': {'Inactive groups': ['Multiline', ['grpo/zero_variance_group_fraction', 'grpo/all_zero_score_group_fraction', 'grpo/all_one_score_group_fraction']], 'Group size': ['Multiline', ['grpo/group_size_min', 'grpo/group_size_max']], 'Reward spread': ['Multiline', ['grpo/reward_std_mean']]}, '04 Update': {'Positive ratios': ['Multiline', ['diagnostics/update_micro_mean/positive/ratio_.*fraction']], 'Negative ratios': ['Multiline', ['diagnostics/update_micro_mean/negative/ratio_.*fraction']], 'KL': ['Multiline', ['policy/reference_kl_micro_mean']], 'Gradient': ['Multiline', ['optim/grad_norm_preclip_minibatch_mean']], 'LR': ['Multiline', ['optim/lr_next_rollout_update']]}, '05 Runtime': {'Tokens': ['Multiline', ['tokens/action_mean', 'tokens/observation_mean']], 'Throughput': ['Multiline', ['throughput/action_tokens_per_s_.*']], 'Seconds': ['Multiline', ['timing_s/.*']]}})
 
     def log(self, data, step):
         for key, value in data.items():
